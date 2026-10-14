@@ -1,0 +1,37 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "1. Flash MicroPython firmware (one time)",
+      "type": "shell",
+      "command": "esptool --chip esp32c3 erase-flash; esptool --chip esp32c3 --baud 460800 write-flash 0 '${input:firmware}'",
+      "problemMatcher": []
+    },
+    {
+      "label": "2. Run main.py (no save to board)",
+      "type": "shell",
+      "command": "mpremote run main.py",
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "3. Upload main.py + secrets.py (runs on every boot)",
+      "type": "shell",
+      "command": "mpremote cp main.py :main.py + cp secrets.py :secrets.py + reset",
+      "problemMatcher": []
+    },
+    {
+      "label": "4. Serial monitor",
+      "type": "shell",
+      "command": "mpremote repl",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "firmware",
+      "type": "promptString",
+      "description": "Path to the ESP32_GENERIC_C3 .bin from micropython.org/download/ESP32_GENERIC_C3"
+    }
+  ]
+}

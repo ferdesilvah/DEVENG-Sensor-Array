@@ -1,0 +1,8 @@
+# WiFi credentials - copy secrets.example.py to secrets.py and fill it in
+secrets.py
+
+# MicroPython firmware - download from micropython.org/download/ESP32_GENERIC_C3
+firmware/
+*.bin
+
+__pycache__/
