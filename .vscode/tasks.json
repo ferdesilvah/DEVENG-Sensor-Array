@@ -25,6 +25,12 @@
       "type": "shell",
       "command": "mpremote repl",
       "problemMatcher": []
+    },
+    {
+      "label": "5. Restart board (instead of the reset button)",
+      "type": "shell",
+      "command": "mpremote reset",
+      "problemMatcher": []
     }
   ],
   "inputs": [
