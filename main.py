@@ -1,5 +1,11 @@
 """
-Two 100 PSI pressure transducers -> Seeed XIAO ESP32C3 (MicroPython)
+Two 100 PSI pressure transducers + a YF-S201 flow meter
+-> Seeed XIAO ESP32C3 (MicroPython)
+
+NOTE: The sensors have not yet been calibrated or validated. Pressure
+readings use the nominal 0.5-4.5V = 0-100 psi datasheet scaling, and flow
+uses the nominal 450 pulses per litre. Treat all readings as approximate
+until each sensor has been checked against a known reference.
 
 Sensors: 3-wire, 5V supply, 0.5V (0 psi) .. 4.5V (100 psi) output.
   Red    -> XIAO 5V pin  (live only when powered over USB / 5V)
@@ -16,6 +22,21 @@ its own divider to halve the signal:
 
 4.5V becomes 2.25V, and 5V (fault) becomes 2.5V.
 A 0.1uF capacitor from each ADC pin to GND helps reduce noise.
+
+Flow meter: YF-S201 hall-effect turbine, 1-30 L/min, sits between
+sensor 1 and the hose. It gives one pulse per rotor turn,
+F (Hz) = 7.5 x Q (L/min), i.e. about 450 pulses per litre.
+  Red    -> XIAO 5V pin
+  Black  -> XIAO GND
+  Yellow -> divider -> XIAO D2 (GPIO4)
+
+The yellow wire swings up to 5V, but ESP32C3 pins take 3.3V max:
+
+    yellow ---[ 10k ]---+---[ 20k (two 10k in series) ]--- GND
+                        |
+                    D2 (GPIO4)
+
+Mount it with the arrow on its body pointing along the flow.
 
 WiFi: credentials live in secrets.py (WIFI_SSID, WIFI_PASSWORD).
 At boot the board joins the network and prints its address over USB
@@ -50,6 +71,13 @@ RECENT_ROWS = 240       # readings kept for the web recorder (~60 s)
 # The sensors must be open to the air (no pressure) when the board starts.
 AUTO_ZERO = True
 
+FLOW_PIN = 4            # XIAO D2 = GPIO4
+# YF-S201 nominal value. For better accuracy, run water into a measuring
+# jug, note how much total_L rose, and set this to 450 * total_L / actual litres.
+PULSES_PER_LITER = 450
+FLOW_WINDOW_MS = 1000   # flow is averaged over about this long
+FLOW_TIMEOUT_MS = 1000  # no pulse for this long reads as 0 L/min (below rated 1 L/min)
+
 HOSTNAME = "pressure-sensor"
 HTTP_PORT = 80
 WIFI_TIMEOUT_S = 20
@@ -65,7 +93,50 @@ start_ms = time.ticks_ms()  # reset in main() once zeroing is done
 wlan = None             # set by connect_wifi() once the board is on the network
 readings_since_header = HEADER_EVERY  # print the header with the first reading
 CSV_HEADER = "t_s," + ",".join("s{0}_volts,s{0}_psi,s{0}_bar,s{0}_kPa".format(i + 1)
-                               for i in range(len(SENSOR_PINS)))
+                               for i in range(len(SENSOR_PINS))) + ",flow_lpm,total_L"
+
+# (pulses since boot, ticks_us of the latest pulse). Replaced as one tuple
+# so the main loop never sees a count from one pulse and a time from another.
+pulse = (0, 0)
+flow_snaps = []  # (count, time) pairs from recent readings, for the flow average
+
+
+def on_pulse(_pin):
+    global pulse
+    pulse = (pulse[0] + 1, time.ticks_us())
+
+
+flow_pin = Pin(FLOW_PIN, Pin.IN, Pin.PULL_UP)
+flow_pin.irq(handler=on_pulse, trigger=Pin.IRQ_RISING)
+
+
+def read_flow():
+    """Returns (flow in L/min over the last ~FLOW_WINDOW_MS, litres since boot).
+
+    Times whole pulse periods rather than counting pulses per reading, so a
+    slow flow doesn't jump between 0 and 0.53 L/min (one pulse per 250 ms).
+    """
+    n, last_us = pulse
+    total_l = n / PULSES_PER_LITER
+    age = time.ticks_diff(time.ticks_us(), last_us)
+    if n == 0 or not 0 <= age < FLOW_TIMEOUT_MS * 1000:
+        flow_snaps.clear()  # stopped: start timing afresh when it restarts
+        return 0.0, total_l
+    if not flow_snaps or flow_snaps[-1][0] != n:
+        flow_snaps.append((n, last_us))
+    # Drop the oldest snapshot while the next one still spans the window
+    while (len(flow_snaps) > 2 and
+           time.ticks_diff(last_us, flow_snaps[1][1]) >= FLOW_WINDOW_MS * 1000):
+        flow_snaps.pop(0)
+    n0, t0 = flow_snaps[0]
+    if n == n0:
+        return 0.0, total_l  # flow just started: no full period timed yet
+    hz = (n - n0) * 1_000_000 / time.ticks_diff(last_us, t0)
+    # If the flow is slowing, pulses stop arriving: the rate can't be more
+    # than one pulse per time since the last one.
+    if age > 0:
+        hz = min(hz, 1_000_000 / age)
+    return hz * 60 / PULSES_PER_LITER, total_l
 
 
 def read_sensor_voltage(adc):
@@ -160,8 +231,13 @@ def take_reading():
         readings.append(reading)
         fields.append(csv)
         row += [reading["psi"], reading["volts"]]
+    flow, total_l = read_flow()
+    flow, total_l = round(flow, 2), round(total_l, 3)
+    fields.append("{:.2f},{:.3f}".format(flow, total_l))
+    row += [flow, total_l]
     print(",".join(fields))
-    latest.update(sensors=readings, seq=seq, t=t)
+    latest.update(sensors=readings, seq=seq, t=t, flow=flow, flow_unit="L/min",
+                  total_l=total_l)
     recent.append(row)
     if len(recent) > RECENT_ROWS:
         recent.pop(0)
@@ -204,6 +280,8 @@ svg{width:100%;height:auto;display:block}
 .flow{fill:none;stroke:var(--l0);stroke-width:4;stroke-linecap:round;stroke-dasharray:2 26;opacity:0}
 .flow.on{opacity:.8;animation:run 1.5s linear infinite}
 @keyframes run{to{stroke-dashoffset:-28}}
+#needle{transform-origin:472px 124px}#needle.on{animation:spin 1.5s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .led{fill:var(--mute)}.led.live{fill:var(--ok)}.led.bad{fill:var(--bad)}
 .name{fill:var(--mute);font-size:19px;letter-spacing:.06em}
 .val{fill:var(--fg);font-size:44px;font-weight:600;font-variant-numeric:tabular-nums}
@@ -244,7 +322,7 @@ button:disabled{opacity:.45;cursor:default}
  <rect id="b0" class="blk" x="330" y="80" width="96" height="88" rx="4"/>
  <circle id="led0" class="led" cx="412" cy="94" r="6"/>
  <rect class="fm" x="424" y="80" width="96" height="88" rx="4"/>
- <circle class="dial" cx="472" cy="124" r="24"/><path class="dial" d="M472,124 L486,110"/>
+ <circle class="dial" cx="472" cy="124" r="24"/><path id="needle" class="dial" d="M472,124 L486,110"/>
  <rect id="b1" class="blk" x="776" y="216" width="100" height="84" rx="4"/>
  <circle id="led1" class="led" cx="862" cy="230" r="6"/>
  <text class="dp" x="612" y="58" text-anchor="middle">&Delta;P <tspan id="dp">--</tspan></text>
@@ -256,7 +334,7 @@ button:disabled{opacity:.45;cursor:default}
 
  <path class="lead" d="M472,168 L452,322"/><circle cx="452" cy="322" r="3" fill="var(--mute)"/>
  <text class="name" x="452" y="350" text-anchor="middle">FLOW METER</text>
- <text class="val" x="452" y="398" text-anchor="middle"><tspan id="fv">--</tspan><tspan class="u" id="fu"> not wired</tspan></text>
+ <text class="val" x="452" y="398" text-anchor="middle"><tspan id="fv">--</tspan><tspan class="u"> L/min</tspan></text>
 
  <path class="lead" d="M876,262 L968,290"/><circle cx="968" cy="290" r="3" fill="var(--mute)"/>
  <rect x="980" y="290" width="14" height="14" rx="7" fill="var(--l1)"/>
@@ -277,6 +355,9 @@ button:disabled{opacity:.45;cursor:default}
  <div class="card"><div class="tn">Pressure drop (1 &minus; 2)</div>
   <div class="big"><span id="dpt">--</span><small>psi</small></div>
   <div class="row"><span id="zero">zero offsets --</span></div></div>
+ <div class="card"><div class="tn">Flow meter</div>
+  <div class="big"><span id="flt">--</span><small>L/min</small></div>
+  <div class="row"><span id="tot">-- L since boot</span></div></div>
 </div>
 
 <div class="card"><div class="pvh"><span><b>CSV preview</b><span id="pvname"></span></span><span id="pvnote"></span></div>
@@ -297,20 +378,23 @@ function sensor(i,s){
  q('.v').textContent=(s?s.volts.toFixed(3):'--')+' V';
  q('.fault').textContent=s&&s.fault?'FAULT: '+s.fault:'';
  return bad?null:s.psi}
-function rig(p){
- const ok=p[0]!=null&&p[1]!=null,dp=ok?p[0]-p[1]:null;
+function rig(p,d){
+ const ok=p[0]!=null&&p[1]!=null,dp=ok?p[0]-p[1]:null,fl=d&&d.flow!=null?d.flow:null;
  $('dp').textContent=ok?dp.toFixed(2)+' psi':'--';$('dpt').textContent=ok?dp.toFixed(2):'--';
- // Animate flow while there is pressure at the inlet; faster for a bigger drop.
- const on=p[0]!=null&&p[0]>0.5,dur=Math.max(0.35,2.5-Math.abs(dp||0)/8)+'s';
- ['f0','f1'].forEach(id=>{const f=$(id);f.classList.toggle('on',on);f.style.animationDuration=dur});
+ $('fv').textContent=$('flt').textContent=fl==null?'--':fl.toFixed(2);
+ $('tot').textContent=(fl==null?'--':d.total_l.toFixed(2))+' L since boot';
+ // Animate the pipe and the meter's dial while water flows; faster for more flow.
+ const on=fl>0,dur=Math.max(0.3,2.5-fl/12)+'s';
+ ['f0','f1','needle'].forEach(id=>{const f=$(id);f.classList.toggle('on',on);f.style.animationDuration=dur});
  $('tint').setAttribute('opacity',p[1]==null?0:Math.min(p[1]/100,1)*0.35)}
 // ---- Recorder: every board reading of a run, timed from the run's start ----
-// Board rows are [seq, t_s since boot, s1_psi, s1_volts, s2_psi, s2_volts].
-let last=null,rec=false,run=0,rows=[],t0=null,wall0=0,missed=0,saved=true,note='';
-const COLS=['t_s','clock_time','s1_psi','s1_volts','s2_psi','s2_volts','dp_psi'],PV_MAX=500;
+// Board rows are [seq, t_s since boot, s1_psi, s1_volts, s2_psi, s2_volts,
+// flow_lpm, litres since boot]; volume_L counts from the run's first row.
+let last=null,rec=false,run=0,rows=[],t0=null,v0=0,wall0=0,missed=0,saved=true,note='';
+const COLS=['t_s','clock_time','s1_psi','s1_volts','s2_psi','s2_volts','dp_psi','flow_lpm','volume_L'],PV_MAX=500;
 function csvRow(r){const f=(v,n)=>v==null?'':v.toFixed(n),t=r[1]-t0;
  return [t.toFixed(3),stamp(wall0+t*1000,1),f(r[2],2),f(r[3],3),f(r[4],2),f(r[5],3),
-  r[2]!=null&&r[4]!=null?(r[2]-r[4]).toFixed(2):'']}
+  r[2]!=null&&r[4]!=null?(r[2]-r[4]).toFixed(2):'',f(r[6],2),f(r[7]==null?null:r[7]-v0,3)]}
 function fname(){return 'run'+run+'-'+stamp(wall0)+'.csv'}
 // The preview shows exactly what the download will contain (newest PV_MAX rows).
 $('pvhead').innerHTML=COLS.map(c=>'<th>'+c+'</th>').join('');
@@ -343,7 +427,7 @@ function collect(d){
   last=null}
  if(rec&&d.rows&&last!=null){
   if(d.rows.length&&d.rows[0][0]>last+1)missed+=d.rows[0][0]-last-1;  // fell out of the board's buffer
-  d.rows.forEach(r=>{if(t0==null){t0=r[1];wall0=Date.now()-(d.t-r[1])*1000}rows.push(r)});
+  d.rows.forEach(r=>{if(t0==null){t0=r[1];v0=r[7];wall0=Date.now()-(d.t-r[1])*1000}rows.push(r)});
   if(d.rows.length)pvAdd(d.rows)}
  last=d.seq}
 function stamp(ms,sep){const d=new Date(ms),p=(n,w)=>String(n).padStart(w||2,'0');
@@ -359,11 +443,10 @@ addEventListener('beforeunload',e=>{if(rec||(!saved&&rows.length)){e.preventDefa
 async function tick(){
  try{const d=await (await fetch(last==null?'/data':'/data?since='+last,{cache:'no-store'})).json(),s=d.sensors;
   collect(d);
-  const p=[sensor(0,s[0]),sensor(1,s[1])];rig(p);
-  if(d.flow!=null){$('fv').textContent=d.flow.toFixed(2);$('fu').textContent=' '+(d.flow_unit||'L/min')}
+  rig([sensor(0,s[0]),sensor(1,s[1])],d);
   $('zero').textContent='zero offsets '+s.map(x=>x.zero.toFixed(3)+' V').join(' / ');
   s.some(x=>x.fault)?status('Live - sensor fault','bad'):status('Live','live')
- }catch(e){status('Lost connection to sensors','bad');sensor(0,null);sensor(1,null);rig([null,null])}
+ }catch(e){status('Lost connection to sensors','bad');sensor(0,null);sensor(1,null);rig([null,null],null)}
  recUI();setTimeout(tick,500)}
 tick();
 </script></body></html>"""
